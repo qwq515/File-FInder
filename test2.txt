@@ -1,1 +1,17 @@
-今天我在调试一个NLP pipeline，主要问题是tokenizer对mixed Chinese-English input处理不稳定。The model itself seems fine, but the preprocessing step sometimes produces unexpected tokens. 比如输入“debug模式已开启”，理想输出应该是["debug", "模式", "已", "开启"]，但实际却得到["de", "bug", "模", "式已", "开启"]。我检查了`config.json`里的`tokenizer_type`，发现默认值是`bert-base-chinese`，但它对英文子词切分不够sensitive。Then I tried switching to a custom regex-based splitter: `re.split(r'([\u4e00-\u9fff]+|[A-Za-z]+|\d+)', text)`. 这个方法在大多数case下works well，but it fails when there are emojis or URLs like `https://example.com/debug?id=42`. 我加了fallback逻辑：如果regex匹配结果包含空字符串，就回退到`jieba.lcut`加英文空格切分。After that, the F1 score on the mixed test set improved from 0.72 to 0.81. 不过还有一个edge case：中文标点“，”和英文逗号“,”混用时，tokenizer会把它们当成不同token，导致downstream model confusion. 我打算明天写个unit test，用`pytest`跑100条mixed samples，并记录`token_count`和`unknown_token_ratio`。Overall, the debugging session was productive, but I still need to check memory usage when batch_size=32. 如果你也遇到类似问题，建议先打印`tokenizer.encode(text)`的原始输出，don’t trust the pretty-printed version. 好了，先写到这里，我要去run `python debug.py --verbose`了。
+This morning I debugged a cache inconsistency issue in a small API service. 
+The symptom was simple: after a user updated a profile record, the API sometimes returned stale data for several seconds. 
+English and numeric fields were usually correct, but display names and descriptions were occasionally out of date. 
+The database itself looked fine, so the problem was almost certainly in the caching layer.
+I started by checking the Redis keys. 
+The service used a key pattern like user:profile:{id} with a TTL of 300 seconds. 
+On update, the code wrote to the database and then called cache.delete(key). 
+That sequence looked correct, but the logs showed a race condition. 
+A read request could repopulate the cache with the old database row between the update transaction and the delete call. 
+Under low traffic the window was tiny, but under concurrent requests it was wide enough to reproduce.
+I added temporary logging around cache.get, cache.set, and cache.delete, including request IDs and timestamps. The logs confirmed the race: one request read the old row and wrote it back to Redis after the delete had already run. 
+I then tried a versioned-key approach. Instead of deleting the cache entry, the update path incremented a version field and wrote a new key such as user:profile:{id}:v2. 
+Readers always fetched the current version from a small metadata key. This removed the delete race entirely.
+After the change, I ran a load test with 200 concurrent update and read requests. 
+Stale reads dropped from about 3 percent to zero in a ten-minute run. I also added a metric for cache hit rate and a warning log when the metadata version and data key disagree. 
+The fix was small, but the debugging process reminded me to verify assumptions with logs instead of trusting the intended code path. 
+Tomorrow I will add a regression test that simulates the read-repopulate-delete interleaving, so this bug does not return silently.
